@@ -6,6 +6,7 @@ import logging
 import os
 import secrets
 import threading
+import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import requests
@@ -36,6 +37,7 @@ DEFAULT_SIZE = os.getenv("DEFAULT_SIZE", "1024x1024").strip().lower()
 DEFAULT_QUALITY = os.getenv("DEFAULT_QUALITY", "standard").strip().lower()
 DEFAULT_ENHANCE = os.getenv("DEFAULT_ENHANCE", "off").strip().lower()
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "180"))
+REQUEST_RETRIES = int(os.getenv("REQUEST_RETRIES", "2"))
 WELCOME_IMAGE_URL = os.getenv(
     "WELCOME_IMAGE_URL",
     "https://files.catbox.moe/xmqm6h.png",
@@ -48,7 +50,16 @@ ADMIN_IDS = {
     if value.strip().isdigit()
 }
 
-SUPPORTED_MODELS = ["gpt-image-1", "dalle3", "othmaker2"]
+SUPPORTED_MODELS = ["gpt-image-1", "dall-e-3", "nextlm-image-1", "dall-e-2"]
+MODEL_ALIASES = {
+    "gpt-image-1": "gpt-image-1",
+    "dalle3": "dall-e-3",
+    "dall-e-3": "dall-e-3",
+    "othmaker2": "nextlm-image-1",
+    "nextlm-image-1": "nextlm-image-1",
+    "dalle2": "dall-e-2",
+    "dall-e-2": "dall-e-2",
+}
 SUPPORTED_SIZES = ["1024x1024", "1024x1536", "1536x1024", "auto"]
 SUPPORTED_QUALITIES = ["standard", "hd", "high", "auto"]
 MAX_PROMPT_CACHE = 300
@@ -57,8 +68,9 @@ LOADING_FRAMES = ["⏳", "⌛", "🌘", "🌗", "🌕", "⚡"]
 
 MODEL_LABELS = {
     "gpt-image-1": "gpt-image-1",
-    "dalle3": "dall·e 3",
-    "othmaker2": "oth maker 2",
+    "dall-e-3": "dall·e 3",
+    "nextlm-image-1": "nextlm image 1",
+    "dall-e-2": "dall·e 2",
 }
 QUALITY_LABELS = {
     "standard": "standard",
@@ -97,7 +109,8 @@ def safe_trim(text: str, limit: int) -> str:
 
 def normalize_model(value: str) -> str:
     value = (value or "").strip().lower()
-    return value if value in SUPPORTED_MODELS else "gpt-image-1"
+    canonical = MODEL_ALIASES.get(value, value)
+    return canonical if canonical in SUPPORTED_MODELS else "gpt-image-1"
 
 
 def normalize_size(value: str) -> str:
@@ -395,7 +408,7 @@ def build_help_caption(user_id: int, notice: Optional[str] = None) -> str:
         "✦ <b>ǫᴜɪᴄᴋ ʜᴇʟᴘ</b>\n"
         f"{build_notice(notice)}"
         "• <code>/img neon tiger in tokyo rain</code>\n"
-        "• <code>/img dalle3 | astronaut on a horse</code>\n"
+        "• <code>/img dall-e-3 | astronaut on a horse</code>\n"
         "• <code>/img storm knight --enhance</code>\n"
         "• <code>/img dark castle --neg text, blurry, watermark</code>\n"
         "• <code>/setneg</code> then send neg prompt\n"
@@ -410,8 +423,9 @@ def build_models_caption(user_id: int, notice: Optional[str] = None) -> str:
         "✦ <b>ᴍᴏᴅᴇʟ ɢᴜɪᴅᴇ</b>\n"
         f"{build_notice(notice)}"
         "• <code>gpt-image-1</code> versatile + sharp\n"
-        "• <code>dalle3</code> creative + polished\n"
-        "• <code>othmaker2</code> stylized + bold\n\n"
+        "• <code>dall-e-3</code> creative + polished\n"
+        "• <code>nextlm-image-1</code> stylized + bold\n"
+        "• <code>dall-e-2</code> classic fallback\n\n"
         f"current <code>{html.escape(display_model(settings['model']))}</code>\n"
         f"{build_queue_line(user_id)}\n"
         "open studio to switch instantly\n\n"
@@ -481,12 +495,16 @@ def build_panel_markup(user_id: int) -> types.InlineKeyboardMarkup:
             callback_data="set:model:gpt-image-1",
         ),
         types.InlineKeyboardButton(
-            display_check(settings["model"], "dalle3", "dall·e 3"),
-            callback_data="set:model:dalle3",
+            display_check(settings["model"], "dall-e-3", "dall·e 3"),
+            callback_data="set:model:dall-e-3",
         ),
         types.InlineKeyboardButton(
-            display_check(settings["model"], "othmaker2", "oth 2"),
-            callback_data="set:model:othmaker2",
+            display_check(settings["model"], "nextlm-image-1", "nextlm"),
+            callback_data="set:model:nextlm-image-1",
+        ),
+        types.InlineKeyboardButton(
+            display_check(settings["model"], "dall-e-2", "dall·e 2"),
+            callback_data="set:model:dall-e-2",
         ),
     )
     markup.row(
@@ -865,37 +883,51 @@ def generate_image(
         size,
         quality,
     )
-    response = requests.post(
-        IMAGE_API_URL,
-        headers=headers,
-        json=body,
-        timeout=REQUEST_TIMEOUT,
-    )
 
-    try:
-        payload = response.json()
-    except ValueError:
-        payload = {"message": response.text[:500]}
+    last_error = "unknown error"
+    max_attempts = max(1, REQUEST_RETRIES + 1)
 
-    if response.status_code >= 400:
-        raise RuntimeError(f"api {response.status_code}: {extract_text_error(payload)}")
+    for attempt in range(1, max_attempts + 1):
+        response = requests.post(
+            IMAGE_API_URL,
+            headers=headers,
+            json=body,
+            timeout=REQUEST_TIMEOUT,
+        )
 
-    image_url, image_bytes, metadata = extract_first_image_payload(payload)
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = {"message": response.text[:500]}
 
-    if image_bytes is not None:
-        return image_bytes, None, metadata
+        if response.status_code < 400:
+            image_url, image_bytes, metadata = extract_first_image_payload(payload)
 
-    if image_url:
-        image_response = requests.get(image_url, timeout=REQUEST_TIMEOUT)
-        image_response.raise_for_status()
-        bio = io.BytesIO(image_response.content)
-        bio.name = "generated.png"
-        bio.seek(0)
-        return bio, image_url, metadata
+            if image_bytes is not None:
+                return image_bytes, None, metadata
 
-    raise RuntimeError(
-        f"no image found in api response: {json.dumps(payload, ensure_ascii=False)[:600]}"
-    )
+            if image_url:
+                image_response = requests.get(image_url, timeout=REQUEST_TIMEOUT)
+                image_response.raise_for_status()
+                bio = io.BytesIO(image_response.content)
+                bio.name = "generated.png"
+                bio.seek(0)
+                return bio, image_url, metadata
+
+            raise RuntimeError(
+                f"no image found in api response: {json.dumps(payload, ensure_ascii=False)[:600]}"
+            )
+
+        last_error = f"api {response.status_code}: {extract_text_error(payload)}"
+        is_retryable = response.status_code >= 500 or "530" in last_error
+        if is_retryable and attempt < max_attempts:
+            logger.warning("Retrying image generation after error: %s", last_error)
+            time.sleep(min(2 * attempt, 4))
+            continue
+
+        raise RuntimeError(last_error)
+
+    raise RuntimeError(last_error)
 
 
 def parse_img_command(command_text: str, current_model: str) -> Dict[str, Any]:
@@ -907,14 +939,14 @@ def parse_img_command(command_text: str, current_model: str) -> Dict[str, Any]:
 
     if "|" in raw:
         maybe_model, prompt_part = raw.split("|", 1)
-        maybe_model = maybe_model.strip().lower()
+        maybe_model = normalize_model(maybe_model)
         if maybe_model in SUPPORTED_MODELS:
             model = maybe_model
             raw = prompt_part.strip()
     else:
         parts = raw.split(maxsplit=1)
-        if len(parts) == 2 and parts[0].lower() in SUPPORTED_MODELS:
-            model = parts[0].lower()
+        if len(parts) == 2 and normalize_model(parts[0]) in SUPPORTED_MODELS:
+            model = normalize_model(parts[0])
             raw = parts[1].strip()
 
     enhance = False
@@ -1020,8 +1052,11 @@ def build_result_markup(prompt_id: str) -> types.InlineKeyboardMarkup:
     )
     markup.row(
         types.InlineKeyboardButton("gpt-1", callback_data=f"run:{prompt_id}:gpt-image-1"),
-        types.InlineKeyboardButton("dall·e 3", callback_data=f"run:{prompt_id}:dalle3"),
-        types.InlineKeyboardButton("oth 2", callback_data=f"run:{prompt_id}:othmaker2"),
+        types.InlineKeyboardButton("dall·e 3", callback_data=f"run:{prompt_id}:dall-e-3"),
+        types.InlineKeyboardButton("nextlm", callback_data=f"run:{prompt_id}:nextlm-image-1"),
+    )
+    markup.row(
+        types.InlineKeyboardButton("dall·e 2", callback_data=f"run:{prompt_id}:dall-e-2"),
     )
     return markup
 
@@ -1057,7 +1092,7 @@ class StatusAnimator(threading.Thread):
         while not self._stop_event.wait(1.2):
             frame = LOADING_FRAMES[index % len(LOADING_FRAMES)]
             try:
-                bot.send_chat_action(self.chat_id, "upload_photo")
+                bot.send_chat_action(self.chat_id, "typing")
             except Exception:
                 pass
             try:
@@ -1142,7 +1177,7 @@ def process_generation(
     animator.start()
 
     try:
-        bot.send_chat_action(chat_id, "upload_photo")
+        bot.send_chat_action(chat_id, "typing")
         effective_prompt = compose_effective_prompt(prompt, enhance, negative_prompt)
         image_file, image_url, metadata = generate_image(
             prompt=effective_prompt,
@@ -1166,6 +1201,7 @@ def process_generation(
         except Exception:
             pass
 
+        bot.send_chat_action(chat_id, "upload_photo")
         bot.send_photo(
             chat_id,
             photo=image_file,
@@ -1378,13 +1414,14 @@ def setmodel_handler(message):
         return
 
     raw_model = parts[1].strip().lower()
-    if raw_model not in SUPPORTED_MODELS:
+    normalized_model = normalize_model(raw_model)
+    if raw_model not in MODEL_ALIASES and normalized_model not in SUPPORTED_MODELS:
         upsert_ui_message(message.chat.id, message.from_user.id, "panel", "unsupported model")
         return
 
     settings = get_user_settings(message.from_user.id)
-    settings["model"] = raw_model
-    upsert_ui_message(message.chat.id, message.from_user.id, "panel", f"model set to {display_model(raw_model)}")
+    settings["model"] = normalized_model
+    upsert_ui_message(message.chat.id, message.from_user.id, "panel", f"model set to {display_model(normalized_model)}")
 
 
 @bot.message_handler(commands=["setsize"])
